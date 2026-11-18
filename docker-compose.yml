@@ -5,9 +5,15 @@
 #
 # postgres 镜像复用 docker/postgres-test/Dockerfile（pgvector + zhparser 中文分词），
 # 该镜像同时服务于集成测试与本地体验，保证两处数据库能力一致。
+#
+# 离线部署：postgres 与 langhuan 声明了 image: 名字。在离线机器上先
+#   docker load -i langhuan-docker-images-*.tar.gz
+# 导入同名镜像后直接 `docker compose up -d --no-build`，compose 检测到本地
+# 镜像已存在就不会触发构建（镜像由 .github/workflows/docker-images.yml 构建）。
 
 services:
   postgres:
+    image: langhuan-postgres:pg17
     build:
       context: .
       dockerfile: docker/postgres-test/Dockerfile
@@ -32,6 +38,7 @@ services:
       retries: 12
 
   langhuan:
+    image: langhuan-app:latest
     build: .
     ports:
       - "8080:8080"

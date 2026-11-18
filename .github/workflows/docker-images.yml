@@ -1,0 +1,116 @@
+# 离线部署镜像构建：在 GitHub Actions 上构建 docker-compose.yml 所需的全部镜像，
+# docker save 打包为压缩 tarball 并挂到 GitHub Release，供下载后拷贝到离线服务器
+# docker load 部署（解决本地构建时拉取 Go/pnpm/apt 依赖的网络问题）。
+#
+# 用法（fork 仓库）：
+#   1. 把本文件提交到默认分支（workflow_dispatch 的入口才会出现在 Actions 页）
+#   2. Actions -> Build Docker Images -> Run workflow（默认 linux/amd64）
+#   3. 构建完成后在 Releases 页下载 langhuan-docker-images-*.tar.gz
+#
+# 注意：产物挂到 Release（永久保存）而不是 workflow artifact（默认 90 天过期）。
+
+name: Build Docker Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: '目标 CPU 架构（离线服务器的架构）'
+        type: choice
+        options:
+          - amd64
+          - arm64
+        default: amd64
+
+permissions:
+  contents: write # 创建 Release 并上传镜像包
+
+jobs:
+  build:
+    name: Build images (linux/${{ inputs.arch }})
+    runs-on: ubuntu-latest
+    env:
+      # 与 docker-compose.yml 中的 image: 名字保持一致，load 后 compose 直接复用
+      APP_IMAGE: langhuan-app:latest
+      PG_IMAGE: langhuan-postgres:pg17
+      REDIS_IMAGE: redis:7-alpine
+    steps:
+      - uses: actions/checkout@v4
+
+      # arm64 交叉构建需要 qemu（amd64 为 runner 原生架构，跳过）
+      - uses: docker/setup-qemu-action@v3
+        if: inputs.arch != 'amd64'
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build langhuan app image
+        run: |
+          docker buildx build \
+            --platform "linux/${{ inputs.arch }}" \
+            --load \
+            -t "$APP_IMAGE" \
+            -t "langhuan-app:$(date +%Y%m%d)-${GITHUB_SHA::7}" \
+            .
+
+      - name: Build postgres image (pgvector + zhparser)
+        run: |
+          docker buildx build \
+            --platform "linux/${{ inputs.arch }}" \
+            --load \
+            -t "$PG_IMAGE" \
+            -f docker/postgres-test/Dockerfile \
+            .
+
+      - name: Pull redis image
+        run: docker pull --platform "linux/${{ inputs.arch }}" "$REDIS_IMAGE"
+
+      - name: Export images to compressed tarball
+        run: |
+          suffix="$(date +%Y%m%d)-${GITHUB_SHA::7}"
+          bundle="langhuan-docker-images-${{ inputs.arch }}-${suffix}"
+          docker save "$APP_IMAGE" "$PG_IMAGE" "$REDIS_IMAGE" \
+            | gzip > "${bundle}.tar.gz"
+          sha256sum "${bundle}.tar.gz" > "${bundle}.tar.gz.sha256"
+          echo "BUNDLE=${bundle}.tar.gz" >> "$GITHUB_ENV"
+          ls -lh "${bundle}"*
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: docker-images-${{ inputs.arch }}-${{ github.run_number }}
+          name: Docker images linux/${{ inputs.arch }} #${{ github.run_number }}
+          body: |
+            docker-compose.yml 所需的全部镜像（linux/${{ inputs.arch }}）：
+            `langhuan-app:latest`、`langhuan-postgres:pg17`、`redis:7-alpine`。
+
+            ## 离线服务器部署
+
+            1. 下载 `${{ env.BUNDLE }}` 与同名 `.sha256`，连同仓库中的
+               `docker-compose.yml`、`docker/compose/config.yaml` 一起拷贝到服务器
+               （保持 `docker/compose/config.yaml` 的相对目录结构）。
+
+            2. 校验并导入镜像：
+
+            ```bash
+            sha256sum -c langhuan-docker-images-*.tar.gz.sha256
+            docker load -i langhuan-docker-images-*.tar.gz
+            ```
+
+            3. 在 `docker-compose.yml` 所在目录启动（镜像已 load，`--no-build` 确保
+               compose 不会尝试联网构建）：
+
+            ```bash
+            docker compose up -d --no-build
+            ```
+
+            4. 打开 http://<server>:8080 完成首次初始化。
+
+            ## 生产前必须修改
+
+            `docker/compose/config.yaml` 为本地体验默认值，生产部署请至少替换：
+            `credentials.encryption_key`（`openssl rand -base64 32`）、
+            `server.base_url`（HTTPS 域名）+ `auth.session.secure_cookie: true`、
+            PostgreSQL 的 `POSTGRES_PASSWORD` 与 DSN 密码、Redis 密码。
+          files: |
+            ${{ env.BUNDLE }}
+            ${{ env.BUNDLE }}.sha256
